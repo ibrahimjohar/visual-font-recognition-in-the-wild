@@ -1,0 +1,38 @@
+# Data & fonts (large, regenerable, and font files have mixed licenses — don't commit)
+data/
+*.ttf
+*.otf
+*.woff
+*.woff2
+
+# Model checkpoints
+models/*.pt
+models/*.pth
+models/*.onnx
+models/checkpoints/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment/secrets
+.env
+*.env
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
+runs/
+wandb/
