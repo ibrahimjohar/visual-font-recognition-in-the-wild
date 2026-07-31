@@ -29,6 +29,13 @@ Input image -> [Stage A: Text Detection] -> boxes -> [Stage B: Crop/normalize]
 - Stage C is the core deliverable — fully custom-trained, primarily on synthetic data with
   augmentation to close the synthetic-to-real gap.
 
+## Setup
+- Python 3.13, venv at `.venv/` (already created — do not recreate).
+- Install/update deps: `./.venv/Scripts/python.exe -m pip install -r requirements.txt`
+- After adding a new package: `./.venv/Scripts/python.exe -m pip freeze > requirements.txt` to keep it current.
+- Current deps (as of Phase 1 setup): pillow, albumentations (opencv-python-headless, scipy, pydantic),
+  requests, nltk, pandas, pyyaml, tqdm, huggingface_hub.
+
 ## Folder layout
 - `data_gen/` — synthetic text-image rendering pipeline (fonts -> labeled crops)
 - `data/` — gitignored; fonts, synthetic dataset, real-photo test set
