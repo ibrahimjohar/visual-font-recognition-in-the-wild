@@ -13,7 +13,6 @@ from backgrounds import sample_background
 from font_loader import get_font
 from text_corpus import sample_text
 
-CANVAS_SIZE = (400, 200)  # oversized working canvas before letterbox, gives room for warp/rotation
 OUTPUT_SIZE = 224  # final square size, matches Phase 2 backbone input
 
 
@@ -59,19 +58,24 @@ def render_crop(family: str, role: str, manifest=None) -> Image.Image:
     font_size = random.randint(28, 60)
     font = get_font(family, role, font_size, manifest)
 
-    bg = sample_background(CANVAS_SIZE)
-    bg_sample_color = bg.getpixel((CANVAS_SIZE[0] // 2, CANVAS_SIZE[1] // 2))
+    # measure text first (throwaway canvas), then size the real canvas around it with a random
+    # margin -- avoids both clipping long text and wasting most of the frame as letterbox padding
+    measurer = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+    bbox = measurer.textbbox((0, 0), text, font=font)
+    text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+    margin_x = random.randint(15, 50)
+    margin_y = random.randint(15, 50)
+    canvas_size = (text_w + 2 * margin_x, text_h + 2 * margin_y)
+
+    bg = sample_background(canvas_size)
+    bg_sample_color = bg.getpixel((canvas_size[0] // 2, canvas_size[1] // 2))
     color = _random_text_color(bg_sample_color)
 
     canvas = bg.copy()
     draw = ImageDraw.Draw(canvas)
-    bbox = draw.textbbox((0, 0), text, font=font)
-    text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-
-    max_x = max(CANVAS_SIZE[0] - text_w, 1)
-    max_y = max(CANVAS_SIZE[1] - text_h, 1)
-    pos_x = random.randint(0, max_x) - bbox[0]
-    pos_y = random.randint(0, max_y) - bbox[1]
+    pos_x = margin_x - bbox[0]
+    pos_y = margin_y - bbox[1]
     draw.text((pos_x, pos_y), text, font=font, fill=color)
 
     letterboxed = _letterbox(canvas, OUTPUT_SIZE)
