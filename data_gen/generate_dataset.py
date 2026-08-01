@@ -94,6 +94,7 @@ def generate(max_classes: int | None, images_per_class: int, seed: int = 42, sto
     skipped = 0
     generated_classes = 0
     total_images_written = 0
+    broken_fonts = []
 
     try:
         for family, role in tqdm(classes, desc="classes"):
@@ -113,8 +114,21 @@ def generate(max_classes: int | None, images_per_class: int, seed: int = 42, sto
             split_assignment = ["train"] * n_train + ["val"] * n_val
 
             class_rows = []
+            class_broken = False
             for i in range(images_per_class):
-                img, text = render_crop(family, role, manifest)
+                img = text = None
+                for attempt in range(3):
+                    try:
+                        img, text = render_crop(family, role, manifest)
+                        break
+                    except Exception as e:
+                        if attempt == 2:
+                            print(f"\nSKIPPING BROKEN FONT: {family}/{role} ({e})")
+                            broken_fonts.append(f"{family}/{role}: {e}")
+                            class_broken = True
+                        # else retry with freshly sampled text/size (next loop iteration)
+                if class_broken:
+                    break
                 fname = f"{i:05d}.jpg"
                 img.save(class_dir / fname, quality=90)
                 class_rows.append({
@@ -126,6 +140,10 @@ def generate(max_classes: int | None, images_per_class: int, seed: int = 42, sto
                     "text": text,
                 })
 
+            if class_broken:
+                shutil.rmtree(class_dir)  # don't leave a partial, unlabeled folder behind
+                continue
+
             writer.writerows(class_rows)
             manifest_file.flush()  # class is now atomically recorded as complete
             generated_classes += 1
@@ -134,9 +152,15 @@ def generate(max_classes: int | None, images_per_class: int, seed: int = 42, sto
         manifest_file.close()
 
     print(f"\nthis run: generated {generated_classes} classes ({total_images_written} images), "
-          f"skipped {skipped} already-complete classes")
+          f"skipped {skipped} already-complete classes, {len(broken_fonts)} broken fonts skipped")
     print(f"manifest -> {MANIFEST_CSV}")
     print(f"config -> {CONFIG_PATH}")
+
+    if broken_fonts:
+        broken_log = Path(__file__).resolve().parent / "broken_fonts.log"
+        with open(broken_log, "a", encoding="utf-8") as f:
+            f.write("\n".join(broken_fonts) + "\n")
+        print(f"broken fonts logged -> {broken_log}")
 
 
 if __name__ == "__main__":
