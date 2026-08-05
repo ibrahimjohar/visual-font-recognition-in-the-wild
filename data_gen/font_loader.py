@@ -28,6 +28,13 @@ EXCLUDED_FAMILIES = {
     "notosanssymbols",
     "notosanssymbols2",
     "notoznamennymusicalnotation",
+    # non-Latin-script fonts that render blank on English text (no Latin glyph coverage) --
+    # confirmed via automated render check against the other 269 non-Latin families in the
+    # manifest, which DO render clean Latin glyphs (Noto's shared Latin base design) and are
+    # correctly kept. See data_gen/README or session notes for the check methodology.
+    "karlatamilinclined",
+    "karlatamilupright",
+    "phetsarath",
 }
 
 VARIATION_NAME_MAP = {
