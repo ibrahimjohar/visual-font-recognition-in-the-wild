@@ -17,6 +17,19 @@ FONTS_DIR = REPO_ROOT / "data" / "fonts" / "google"
 
 ROLES = ["Regular", "Bold", "Italic", "BoldItalic"]
 
+# Non-alphabetic glyph fonts (emoji/symbol/musical-notation) that survive rendering without
+# throwing but produce meaningless font-recognition training data (tofu boxes, unrelated
+# glyph sets). Excluded at class-list build time rather than caught by exception handling,
+# since they render "successfully" -- see data_gen/broken_fonts.log for the crash-only cases.
+EXCLUDED_FAMILIES = {
+    "notoemoji",
+    "notocoloremoji",
+    "notocoloremojicompattest",  # also fails to load (invalid pixel size); listed for clarity
+    "notosanssymbols",
+    "notosanssymbols2",
+    "notoznamennymusicalnotation",
+}
+
 VARIATION_NAME_MAP = {
     "Regular": b"Regular",
     "Bold": b"Bold",
@@ -53,6 +66,9 @@ def build_class_list(manifest=None) -> list[tuple[str, str]]:
 
     classes = []
     for family, files in manifest.items():
+        if family in EXCLUDED_FAMILIES:
+            continue
+
         if "variable_upright" in files:
             names = _get_variation_names(FONTS_DIR / family / "variable_upright.ttf")
             if names:
