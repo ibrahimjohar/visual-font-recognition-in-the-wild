@@ -10,6 +10,10 @@ models/*.pt
 models/*.pth
 models/*.onnx
 models/checkpoints/
+training/checkpoints/
+training/logs/
+training/probed_batch_sizes.json
+training/STOP
 
 # Python
 __pycache__/
