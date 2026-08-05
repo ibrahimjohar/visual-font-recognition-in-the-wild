@@ -1,0 +1,6 @@
+images_per_class: 150
+max_classes_arg: null
+num_classes: 3423
+output_size: 224
+seed: 42
+val_split: 0.15
