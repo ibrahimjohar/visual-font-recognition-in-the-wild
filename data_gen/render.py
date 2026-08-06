@@ -28,15 +28,43 @@ def _random_text_color(bg_sample_color):
     return tuple(random.randint(0, 255) for _ in range(3))
 
 
-def _letterbox(img: Image.Image, size: int) -> Image.Image:
+# minimum glyph height (pixels, in the final size x size output) below which text is no longer
+# reliably legible -- a real bug let ~25% of the dataset ship under this without anyone noticing,
+# because the old letterbox scaled by max(canvas_w, canvas_h): for long text, canvas width dwarfs
+# height, so a single-line sentence could get crushed to ~6-8px tall. this floor is asserted in
+# _crop_or_pad_to_square below so a future change to font_size/margin ranges can't silently
+# regress this again without the assertion firing during generation, not months later in an audit.
+MIN_LEGIBLE_GLYPH_HEIGHT = 20
+
+
+def _crop_or_pad_to_square(img: Image.Image, size: int, font_size: int) -> Image.Image:
+    """Scales by HEIGHT ONLY (not max(w, h)), then crops or pads width to reach size x size.
+    This decouples glyph height from text length entirely -- a 5-character word and a
+    90-character sentence both come out with the same effective glyph height, since neither
+    text width nor number of characters enters the height calculation at all. Long text simply
+    shows a (randomly positioned) horizontal window of the sentence rather than being crushed to
+    fit the whole thing -- which is also a more realistic training signal for real photos, where
+    text is routinely cropped by the frame edge rather than always fully visible."""
     w, h = img.size
-    scale = size / max(w, h)
-    new_w, new_h = int(w * scale), int(h * scale)
+    scale = size / h
+    new_w, new_h = max(1, int(w * scale)), size
     resized = img.resize((new_w, new_h), Image.LANCZOS)
+
+    effective_glyph_height = font_size * scale
+    assert effective_glyph_height >= MIN_LEGIBLE_GLYPH_HEIGHT, (
+        f"effective glyph height {effective_glyph_height:.1f}px fell below the "
+        f"{MIN_LEGIBLE_GLYPH_HEIGHT}px legibility floor (font_size={font_size}, scale={scale:.3f}) "
+        f"-- font_size or margin ranges changed without re-checking this invariant"
+    )
+
     canvas = Image.new("RGB", (size, size), (128, 128, 128))
-    paste_x = (size - new_w) // 2
-    paste_y = (size - new_h) // 2
-    canvas.paste(resized, (paste_x, paste_y))
+    if new_w <= size:
+        paste_x = (size - new_w) // 2
+        canvas.paste(resized, (paste_x, 0))
+    else:
+        crop_x = random.randint(0, new_w - size)
+        cropped = resized.crop((crop_x, 0, crop_x + size, size))
+        canvas.paste(cropped, (0, 0))
     return canvas
 
 
@@ -53,8 +81,12 @@ _AUGMENT = A.Compose([
 ])
 
 
-def render_crop(family: str, role: str, manifest=None) -> Image.Image:
-    text = sample_text()
+def render_crop(family: str, role: str, manifest=None, text: str | None = None) -> Image.Image:
+    # text override lets the regenerate script re-render an existing manifest row with the same
+    # label (fixed letterbox logic, fresh random font size/margin/background/augmentation) rather
+    # than resampling new corpus content and silently changing what that row's text field means
+    if text is None:
+        text = sample_text()
     font_size = random.randint(28, 60)
     font = get_font(family, role, font_size, manifest)
 
@@ -78,7 +110,7 @@ def render_crop(family: str, role: str, manifest=None) -> Image.Image:
     pos_y = margin_y - bbox[1]
     draw.text((pos_x, pos_y), text, font=font, fill=color)
 
-    letterboxed = _letterbox(canvas, OUTPUT_SIZE)
+    letterboxed = _crop_or_pad_to_square(canvas, OUTPUT_SIZE, font_size)
 
     arr = np.array(letterboxed)
     augmented = _AUGMENT(image=arr)["image"]
