@@ -40,7 +40,7 @@ def main():
         x = torch.randn(batch_size, 3, CONFIG.input_size, CONFIG.input_size, device=device)
         y = torch.randint(0, CONFIG.num_classes, (batch_size,), device=device)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model(x)
+            out = model(x, y)  # match the real training path (ArcFace margin needs labels)
             loss = criterion(out, y)
         scaler.scale(loss).backward()
         scaler.step(optimizer)

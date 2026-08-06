@@ -89,7 +89,7 @@ def evaluate(model, loader, device, num_classes: int) -> dict:
         for x, y in loader:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out = model(x)
+                out = model(x)  # no label at eval -- plain cosine similarity, no margin applied
                 loss = criterion(out, y)
             total_loss += loss.item() * x.size(0)
             n += x.size(0)
@@ -183,7 +183,7 @@ def train_phase(phase_cfg: PhaseConfig, class_to_idx: dict[str, int], num_classe
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out = model(x)
+                out = model(x, y)  # ArcFace needs the label to apply the angular margin during training
                 loss = criterion(out, y) / phase_cfg.grad_accum_steps
 
             if check_nan_inf(loss.item()):
@@ -302,7 +302,7 @@ def run_check_a(class_to_idx: dict, num_classes: int, n_steps: int = 600):
             break
         x, y = x.to(device), y.to(device)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model(x)
+            out = model(x, y)  # ArcFace needs the label to apply the angular margin during training
             loss = criterion(out, y)
         scaler.scale(loss).backward()
         scaler.step(optimizer)
