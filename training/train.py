@@ -28,7 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from models.classifier import (build_model, freeze_backbone, unfreeze_last_blocks,
-                                param_groups_for_phase, count_trainable)
+                                param_groups_for_phase, count_trainable, freeze_bn_stats)
 from training.config import CONFIG, PHASE_1, PHASE_2, PhaseConfig
 from training.dataset import FontDataset, load_class_list
 from training.checkpoint import save_checkpoint, load_checkpoint
@@ -44,15 +44,27 @@ def topk_correct(output: torch.Tensor, target: torch.Tensor, ks=(1, 5)) -> dict[
     return {k: correct[:k].reshape(-1).float().sum().item() for k in ks}
 
 
-def load_probed_batch_size(phase_name: str, fallback: int) -> int:
+def load_probed_batch_size(phase_name: str, configured: int) -> int:
+    """The probe verifies headroom, it doesn't dictate the batch size -- config.py's number was
+    chosen alongside the reviewed LR schedule, and silently swapping in the raw probed ceiling
+    would need a linear-scaling-rule LR re-derivation that hasn't happened. If the configured
+    batch doesn't fit within the probed safe ceiling, that's a real problem worth failing loudly
+    on rather than silently shrinking."""
     probe_path = REPO_ROOT / "training" / "probed_batch_sizes.json"
     if not probe_path.exists():
-        print(f"[warn] no probed_batch_sizes.json found -- using config default ({fallback}). "
-              f"Run training/probe_batch_size.py first for a real number.")
-        return fallback
+        print(f"[warn] no probed_batch_sizes.json found -- using config value ({configured}) "
+              f"unverified. Run training/probe_batch_size.py first to confirm it actually fits.")
+        return configured
     with open(probe_path) as f:
         data = json.load(f)
-    return data.get(phase_name, {}).get("safe_batch", fallback)
+    safe_ceiling = data.get(phase_name, {}).get("safe_batch")
+    if safe_ceiling is not None and configured > safe_ceiling:
+        raise RuntimeError(
+            f"[{phase_name}] configured batch_size={configured} exceeds the probed safe "
+            f"ceiling of {safe_ceiling} for this GPU -- lower config.py's batch_size or "
+            f"re-probe if the GPU/model changed."
+        )
+    return configured
 
 
 def build_loaders(class_filter: set[str] | None, batch_size: int, class_to_idx: dict[str, int]):
@@ -76,7 +88,7 @@ def evaluate(model, loader, device, num_classes: int) -> dict:
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            with torch.amp.autocast("cuda"):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 out = model(x)
                 loss = criterion(out, y)
             total_loss += loss.item() * x.size(0)
@@ -133,7 +145,7 @@ def train_phase(phase_cfg: PhaseConfig, class_to_idx: dict[str, int], num_classe
         optimizer, max_lr=[g["lr"] for g in param_groups], total_steps=total_steps,
         pct_start=phase_cfg.warmup_pct, anneal_strategy="cos",
     ) if total_steps > warmup_steps else None
-    scaler = torch.amp.GradScaler("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=False)  # bf16 does not need loss scaling, kept as a structural no-op
     criterion = nn.CrossEntropyLoss(label_smoothing=phase_cfg.label_smoothing)
 
     step_logger = StepLogger(CONFIG.log_dir)
@@ -161,6 +173,7 @@ def train_phase(phase_cfg: PhaseConfig, class_to_idx: dict[str, int], num_classe
 
     for epoch in range(start_epoch, max_epochs):
         model.train()
+        freeze_bn_stats(model)  # model.train() re-enables BN training mode on frozen layers too -- undo that
         running_loss, running_correct, running_n = 0.0, 0, 0
         optimizer.zero_grad(set_to_none=True)
         epoch_step_start = time.time()
@@ -169,7 +182,7 @@ def train_phase(phase_cfg: PhaseConfig, class_to_idx: dict[str, int], num_classe
             step_start = time.time()
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
-            with torch.amp.autocast("cuda"):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 out = model(x)
                 loss = criterion(out, y) / phase_cfg.grad_accum_steps
 
@@ -263,17 +276,24 @@ def train_phase(phase_cfg: PhaseConfig, class_to_idx: dict[str, int], num_classe
     return {"stopped": False, "best_val_top5": best_metric, "final_epoch": epoch}
 
 
-def run_check_a(class_to_idx: dict, num_classes: int, n_steps: int = 40):
-    """Check A: pipeline/VRAM sanity only -- does loss decrease, does the batch size hold."""
+def run_check_a(class_to_idx: dict, num_classes: int, n_steps: int = 600):
+    """Check A: pipeline/VRAM sanity only -- does loss trend down, does the batch size hold.
+    n_steps=600 and a first-50-vs-last-50 average comparison, not first-vs-last single step:
+    with 3,407 classes and a fresh linear head, individual steps are noisy (each batch of ~128
+    barely samples the class space) and loss can even rise briefly before descending as AdamW's
+    moment estimates warm up. A 40-step single-point comparison flagged this as a false FAIL
+    during development; confirmed via a longer run and a single-batch overfit test that the
+    training mechanics were correct and it was just too short a window to see through the noise."""
     print("=== Check A: pipeline + VRAM sanity ===")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = build_model(num_classes, pretrained=CONFIG.pretrained).to(device)
     freeze_backbone(model)
+    freeze_bn_stats(model)
     batch_size = load_probed_batch_size(PHASE_1.name, PHASE_1.batch_size)
     train_loader, _ = build_loaders(None, batch_size, class_to_idx)
 
     optimizer = torch.optim.AdamW(param_groups_for_phase(model, PHASE_1.lr_head, None))
-    scaler = torch.amp.GradScaler("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=False)  # bf16 does not need loss scaling, kept as a structural no-op
     criterion = nn.CrossEntropyLoss()
 
     losses = []
@@ -281,7 +301,7 @@ def run_check_a(class_to_idx: dict, num_classes: int, n_steps: int = 40):
         if i >= n_steps:
             break
         x, y = x.to(device), y.to(device)
-        with torch.amp.autocast("cuda"):
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model(x)
             loss = criterion(out, y)
         scaler.scale(loss).backward()
@@ -292,9 +312,13 @@ def run_check_a(class_to_idx: dict, num_classes: int, n_steps: int = 40):
         if device == "cuda" and i % 10 == 0:
             print(f"  step {i}: loss={loss.item():.3f} gpu_mem={torch.cuda.memory_allocated()/1e6:.0f}MB")
 
-    decreasing = losses[-1] < losses[0]
-    print(f"Check A result: loss {losses[0]:.3f} -> {losses[-1]:.3f} "
-          f"({'PASS' if decreasing else 'FAIL'} -- loss should trend down over {n_steps} steps)")
+    window = min(50, len(losses) // 4) or 1
+    first_avg = sum(losses[:window]) / window
+    last_avg = sum(losses[-window:]) / window
+    decreasing = last_avg < first_avg
+    print(f"Check A result: avg loss (first {window} steps) {first_avg:.3f} -> "
+          f"avg loss (last {window} steps) {last_avg:.3f} "
+          f"({'PASS' if decreasing else 'FAIL'} -- trend should be down over {n_steps} steps)")
     return decreasing
 
 

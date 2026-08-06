@@ -42,6 +42,22 @@ def unfreeze_last_blocks(model: nn.Module, n_blocks: int = 2) -> None:
             param.requires_grad = True
 
 
+def freeze_bn_stats(model: nn.Module) -> None:
+    """model.train() puts every submodule into training mode regardless of requires_grad --
+    freezing a layer's parameters does NOT stop its BatchNorm from recomputing per-batch
+    statistics and updating running_mean/running_var. For a frozen backbone that's wrong: it
+    should use the fixed pretrained running stats, not noisy current-batch statistics, which
+    at small batch sizes can hit a near-zero-variance channel and produce NaN outputs. Call
+    this every time after model.train() in the training loop, for both phases -- it puts
+    BatchNorm layers belonging to any currently-frozen parameters back into eval mode."""
+    for module in model.modules():
+        if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+            frozen = all(not p.requires_grad for p in module.parameters(recurse=False)) \
+                if list(module.parameters(recurse=False)) else True
+            if frozen:
+                module.eval()
+
+
 def param_groups_for_phase(model: nn.Module, lr_head: float, lr_backbone: float | None) -> list[dict]:
     """Discriminative LR: head gets lr_head, any trainable backbone params get lr_backbone.
     Only includes params with requires_grad=True, so call this after freeze/unfreeze."""

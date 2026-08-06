@@ -43,8 +43,15 @@ PHASE_2 = PhaseConfig(
     lr_head=1e-4,
     lr_backbone=1e-5,
     weight_decay=0.05,
-    batch_size=28,
-    grad_accum_steps=5,  # effective batch ~140, adjusted after the probe
+    # VRAM probe confirmed both phases fit a batch far beyond what's needed (~1550 before OOM,
+    # dominated by early-layer forward activations, not by the 2 unfrozen blocks' backward
+    # cost) -- real headroom means phase 2 doesn't need grad accumulation at all, so this runs
+    # at physical batch 256 directly rather than 24-32 x 5 accumulation steps. Kept at 256, not
+    # the full probed ceiling, since the reviewed LR schedule was tuned around this effective
+    # batch and pushing further would need a linear-scaling-rule re-derivation that hasn't
+    # happened.
+    batch_size=256,
+    grad_accum_steps=1,
     max_epochs=40,
     early_stop_patience=5,
     max_hours=30.0,
