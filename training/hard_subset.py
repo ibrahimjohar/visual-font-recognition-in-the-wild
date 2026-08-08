@@ -65,6 +65,33 @@ def build_random_subset(manifest_csv: str, size: int = 500, seed: int = 42) -> s
     return set(rng.sample(sorted(classes), min(size, len(classes))))
 
 
+def build_family_complete_random_subset(manifest_csv: str, size: int = 500, seed: int = 42) -> set[str]:
+    """Like build_random_subset, but samples whole FAMILIES rather than individual classes, so
+    every family that appears is fully represented (all its roles included). Fixes a real gap
+    the original random500 subset had for the hierarchical family/role architecture: sampling
+    individual classes left most families with zero representation, meaning the family ArcFace
+    head's weight vectors for those families never received a training gradient -- an untrained
+    ArcFace vector's cosine similarity can noisily outrank a trained one in top-5, which isn't a
+    problem the flat head (one class = one weight vector, no separate family-only head) ever
+    had. Picks whole families until the target class count is reached, so results are
+    comparable to the original random500 threshold (still ~500 classes, ~1% chance level)."""
+    family_roles: dict[str, set[str]] = {}
+    with open(manifest_csv, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            family_roles.setdefault(row["family"], set()).add(row["class_name"])
+
+    families = sorted(family_roles.keys())
+    rng = random.Random(seed)
+    rng.shuffle(families)
+
+    subset: set[str] = set()
+    for family in families:
+        subset.update(family_roles[family])
+        if len(subset) >= size:
+            break
+    return subset
+
+
 # --- pre-committed Check B thresholds, written down before any run so the pass/fail call
 # can't be rationalized after seeing numbers (per the council's explicit finding that an
 # undefined threshold makes the fix "theater," not a real gate). ---

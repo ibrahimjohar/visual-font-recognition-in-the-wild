@@ -34,7 +34,8 @@ from training.config import CONFIG, PHASE_1, PHASE_2, PhaseConfig
 from training.dataset import FontDataset, load_class_list, load_family_role_lists
 from training.checkpoint import save_checkpoint, load_checkpoint
 from training.monitor import StepLogger, EpochLogger, check_nan_inf
-from training.hard_subset import build_confusable_subset, build_random_subset, SMOKE_TEST_THRESHOLDS
+from training.hard_subset import (build_confusable_subset, build_family_complete_random_subset,
+                                   SMOKE_TEST_THRESHOLDS)
 
 
 class LabelSpace:
@@ -411,8 +412,14 @@ def run_check_b(manifest_csv: str, label_space: LabelSpace):
     thresholds = SMOKE_TEST_THRESHOLDS
 
     confusable = build_confusable_subset(manifest_csv)
-    random500 = build_random_subset(manifest_csv, size=500)
-    print(f"confusable subset: {len(confusable)} classes, random subset: {len(random500)} classes")
+    # family-complete, not a naive per-class random sample -- see build_family_complete_random_subset's
+    # docstring. A per-class random sample left most families with zero training coverage, which is
+    # a real handicap specific to the hierarchical family/role head (its family ArcFace weight
+    # vectors for uncovered families never get a gradient and can noisily outrank trained ones),
+    # not a fair test of whether the architecture scales.
+    random500 = build_family_complete_random_subset(manifest_csv, size=500)
+    print(f"confusable subset: {len(confusable)} classes, random subset: {len(random500)} classes "
+          f"(family-complete)")
 
     results = {}
     for name, subset in [("confusable", confusable), ("random500", random500)]:
