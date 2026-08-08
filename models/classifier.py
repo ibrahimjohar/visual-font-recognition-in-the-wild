@@ -1,28 +1,46 @@
 """
-EfficientNet-B0 embedding backbone + ArcFace head for VFRW Stage C.
+EfficientNet-B0 embedding backbone + hierarchical family/role ArcFace heads for VFRW Stage C.
 
-Switched from a plain linear classifier to ArcFace after Check B showed the flat-softmax
-approach plateauing around 30% top-5 on the hand-picked confusable-font subset (well below
-the 50% pre-committed threshold), while a broad 500-class random subset was still improving
-normally. That split result is the specific signature of a margin problem, not a capacity
-problem: plain softmax only needs *some* positive margin to classify correctly, so it has no
-training pressure to widen the decision boundary between near-identical fonts once average
-accuracy looks fine. ArcFace adds an explicit angular margin to the true class's logit during
-training, forcing the backbone to learn representations where confusable classes are pushed
-apart by a real geometric gap. Same technique used in face recognition for the analogous
-problem (huge class count, many near-identical identities).
+History: plain softmax plateaued at 30% top-5 on the confusable-font subset. Switched to a
+single flat ArcFace head over all classes, which only nudged it to 33.9% top-5, still far below
+the 50% threshold. A confusion-matrix diagnostic on that result showed the real story: the true
+FAMILY appeared in the top-5 predicted families 69.3% of the time, and the true ROLE appeared in
+the top-5 predicted roles 89.3% of the time -- both individually strong -- but getting family
+AND role exactly right simultaneously, within 5 guesses out of a flat 20-way (or 3407-way, same
+result either way) space, was the hard part. That's the textbook signature for a hierarchical
+classifier: decompose one hard joint problem into two problems the model has already mostly
+solved independently.
+
+Architecture: one shared backbone embedding feeds two separate ArcFace heads --
+  - family_classifier: ArcMarginProduct over every distinct font family in the dataset (~1976
+    families). This is the "which typeface" problem -- genuinely distinct visual entities.
+  - role_classifier: ArcMarginProduct over just 4 classes (Regular/Bold/Italic/BoldItalic),
+    trained GLOBALLY across every family's images, not per-family. This turns "distinguish bold
+    from regular" from a low-data problem scattered across thousands of narrow per-family
+    buckets into one well-populated 4-way problem with the full dataset behind it.
+
+Final (family, role) prediction combines both heads' scores at inference (see
+training/train.py's hierarchical evaluation) rather than predicting the flat class directly.
 
 Freeze/unfreeze helpers implement the same 2-phase progressive-unfreezing plan as before:
-phase 1 trains only the ArcFace head (backbone fully frozen), phase 2 additionally unfreezes
-the last N MBConv blocks.
+phase 1 trains only the two heads (backbone fully frozen), phase 2 additionally unfreezes the
+last N MBConv blocks. Both heads share the "classifier" name prefix (family_classifier /
+role_classifier) so the existing name-based freeze/unfreeze/param-group logic needs no changes
+beyond that shared prefix.
 """
 
 import math
 
-import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# timm is imported lazily, inside FontEmbeddingModel.__init__, not here at module level. On
+# Windows, DataLoader worker processes (spawn, not fork) re-run this module's top-level imports
+# even though workers only ever touch the Dataset class, never the model -- a module-level timm
+# import was dragging its full transitive dependency chain (huggingface_hub, filelock, etc.)
+# into every worker's memory for nothing, which combined with a tight system RAM budget produced
+# a real MemoryError when num_workers was raised above 0.
 
 
 class ArcMarginProduct(nn.Module):
@@ -68,37 +86,44 @@ class ArcMarginProduct(nn.Module):
 
 class FontEmbeddingModel(nn.Module):
     """Backbone (num_classes=0 -> returns the pooled 1280-d feature vector directly, no linear
-    head from timm) feeding into an ArcMarginProduct head. forward() takes labels only during
-    training; eval/inference calls it with labels=None for plain cosine-similarity ranking."""
+    head from timm) feeding into two separate ArcMarginProduct heads: family and role. forward()
+    takes labels only during training (family_labels, role_labels both required together, or
+    both None for eval); eval/inference calls it with labels=None for plain cosine-similarity
+    ranking on both heads."""
 
-    def __init__(self, num_classes: int, pretrained: bool = True, embedding_dim: int = 1280,
-                 arc_s: float = 30.0, arc_m: float = 0.30):
+    def __init__(self, num_families: int, num_roles: int = 4, pretrained: bool = True,
+                 embedding_dim: int = 1280, arc_s: float = 30.0, arc_m: float = 0.30):
         super().__init__()
+        import timm  # see the module-level comment on the lazy import
         self.backbone = timm.create_model("efficientnet_b0", pretrained=pretrained, num_classes=0)
-        self.classifier = ArcMarginProduct(embedding_dim, num_classes, s=arc_s, m=arc_m)
+        self.family_classifier = ArcMarginProduct(embedding_dim, num_families, s=arc_s, m=arc_m)
+        self.role_classifier = ArcMarginProduct(embedding_dim, num_roles, s=arc_s, m=arc_m)
 
-    def forward(self, x: torch.Tensor, labels: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, family_labels: torch.Tensor | None = None,
+                role_labels: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         features = self.backbone(x)
-        return self.classifier(features, labels)
+        family_logits = self.family_classifier(features, family_labels)
+        role_logits = self.role_classifier(features, role_labels)
+        return family_logits, role_logits
 
 
-def build_model(num_classes: int, pretrained: bool = True) -> nn.Module:
-    return FontEmbeddingModel(num_classes, pretrained=pretrained)
+def build_model(num_families: int, num_roles: int = 4, pretrained: bool = True) -> nn.Module:
+    return FontEmbeddingModel(num_families, num_roles, pretrained=pretrained)
 
 
 def freeze_backbone(model: nn.Module) -> None:
-    """Phase 1: everything except the ArcFace head is frozen."""
+    """Phase 1: everything except the two ArcFace heads is frozen."""
     for name, param in model.named_parameters():
-        param.requires_grad = name.startswith("classifier")
+        param.requires_grad = name.startswith("family_classifier") or name.startswith("role_classifier")
 
 
 def unfreeze_last_blocks(model: nn.Module, n_blocks: int = 2) -> None:
-    """Phase 2: unfreeze the head plus the last n_blocks of the backbone's stages (timm's
+    """Phase 2: unfreeze both heads plus the last n_blocks of the backbone's stages (timm's
     EfficientNet exposes stages as backbone.blocks, a Sequential of 7 stages for B0). Early
     stages stay frozen -- they encode generic edge/texture features that transfer fine from
     ImageNet; font discrimination lives in the later, more shape-specific stages."""
     for name, param in model.named_parameters():
-        param.requires_grad = name.startswith("classifier")
+        param.requires_grad = name.startswith("family_classifier") or name.startswith("role_classifier")
 
     total_stages = len(model.backbone.blocks)
     unfreeze_from = max(0, total_stages - n_blocks)
@@ -107,7 +132,7 @@ def unfreeze_last_blocks(model: nn.Module, n_blocks: int = 2) -> None:
             param.requires_grad = True
 
     # conv_head/bn2 sit between the last block and the pooled feature output -- unfreeze them
-    # too when any backbone blocks are trainable, otherwise the head is fine-tuning on frozen
+    # too when any backbone blocks are trainable, otherwise the heads are fine-tuning on frozen
     # features right up until the last block, which is an awkward halfway point.
     for name, param in model.named_parameters():
         if name.startswith("backbone.conv_head") or name.startswith("backbone.bn2"):
@@ -131,10 +156,11 @@ def freeze_bn_stats(model: nn.Module) -> None:
 
 
 def param_groups_for_phase(model: nn.Module, lr_head: float, lr_backbone: float | None) -> list[dict]:
-    """Discriminative LR: head gets lr_head, any trainable backbone params get lr_backbone.
+    """Discriminative LR: both heads get lr_head, any trainable backbone params get lr_backbone.
     Only includes params with requires_grad=True, so call this after freeze/unfreeze."""
-    head_params = [p for n, p in model.named_parameters() if p.requires_grad and n.startswith("classifier")]
-    backbone_params = [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith("classifier")]
+    is_head = lambda n: n.startswith("family_classifier") or n.startswith("role_classifier")
+    head_params = [p for n, p in model.named_parameters() if p.requires_grad and is_head(n)]
+    backbone_params = [p for n, p in model.named_parameters() if p.requires_grad and not is_head(n)]
 
     groups = [{"params": head_params, "lr": lr_head}]
     if backbone_params:

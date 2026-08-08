@@ -18,14 +18,17 @@ import torch.nn as nn
 
 from models.classifier import build_model, freeze_backbone, unfreeze_last_blocks, freeze_bn_stats
 from training.config import CONFIG, PHASES
+from training.dataset import load_family_role_lists
 
 
 def main():
     phase_name, batch_size = sys.argv[1], int(sys.argv[2])
     phase = next(p for p in PHASES if p.name == phase_name)
+    families, roles = load_family_role_lists(CONFIG.manifest_csv)
+    num_families, num_roles = len(families), len(roles)
 
     device = "cuda"
-    model = build_model(CONFIG.num_classes, pretrained=False).to(device)
+    model = build_model(num_families, num_roles, pretrained=False).to(device)
     if phase.unfreeze_blocks == 0:
         freeze_backbone(model)
     else:
@@ -38,10 +41,12 @@ def main():
 
     try:
         x = torch.randn(batch_size, 3, CONFIG.input_size, CONFIG.input_size, device=device)
-        y = torch.randint(0, CONFIG.num_classes, (batch_size,), device=device)
+        family_y = torch.randint(0, num_families, (batch_size,), device=device)
+        role_y = torch.randint(0, num_roles, (batch_size,), device=device)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model(x, y)  # match the real training path (ArcFace margin needs labels)
-            loss = criterion(out, y)
+            # match the real training path (ArcFace margin needs labels)
+            family_logits, role_logits = model(x, family_y, role_y)
+            loss = criterion(family_logits, family_y) + criterion(role_logits, role_y)
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()

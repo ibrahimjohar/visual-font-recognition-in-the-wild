@@ -74,7 +74,18 @@ class GlobalConfig:
     stop_sentinel: str = "training/STOP"
     seed: int = 42
     drift_gap_epochs: int = 4  # consecutive epochs of widening train/val loss gap -> flag
-    num_workers: int = 0  # windows: multiprocessing dataloader crashes, keep 0
+    # was 0 ("windows multiprocessing dataloader crashes") but that was never actually
+    # re-verified against this project's dataset/transform code. num_workers=0 was almost
+    # certainly the real cause of the phase-2 stalls observed on the random-500 Check B run:
+    # single-threaded synchronous JPEG decode/transform left the GPU idle between batches, worse
+    # under memory pressure. Raising this to 4 hit a real MemoryError on this machine (only
+    # ~1.7GB free system RAM at the time) -- Windows spawns each worker as a fresh process that
+    # re-imports the whole script, and that used to include timm's heavy dependency chain before
+    # the lazy-import fix in models/classifier.py. 2 is the conservative number given how tight
+    # memory is here; revisit upward only after confirming more headroom (Task Manager, not a
+    # guess) -- this exact bug (guessing a resource number instead of measuring it) is what
+    # caused the original batch-size and glyph-height problems earlier in this project.
+    num_workers: int = 2
 
 
 CONFIG = GlobalConfig()
