@@ -67,13 +67,37 @@ def load_probed_batch_size(phase_name: str, configured: int) -> int:
     return configured
 
 
-def build_loaders(class_filter: set[str] | None, batch_size: int, class_to_idx: dict[str, int]):
+def build_loaders(class_filter: set[str] | None, batch_size: int, class_to_idx: dict[str, int],
+                   hard_negative_classes: set[str] | None = None, oversample_factor: float = 5.0):
+    """hard_negative_classes: if given, a WeightedRandomSampler oversamples those classes'
+    training examples by oversample_factor -- concentrates gradient signal on classes already
+    confirmed (via confusion matrix) to be where the model's errors are, without touching
+    architecture. Only applies to the train loader; val stays a plain, unweighted pass so the
+    reported metric isn't itself distorted by the sampling."""
     train_ds = FontDataset(CONFIG.manifest_csv, CONFIG.data_dir, "train", class_to_idx, class_filter)
     val_ds = FontDataset(CONFIG.manifest_csv, CONFIG.data_dir, "val", class_to_idx, class_filter)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                               num_workers=CONFIG.num_workers, pin_memory=True, drop_last=True)
+
+    # persistent_workers keeps the worker pool alive across epochs instead of respawning it each
+    # time (real cost on Windows, where workers start via spawn not fork); prefetch_factor gives
+    # each worker a small queue of batches ready ahead of the GPU asking, so a slow JPEG decode
+    # doesn't stall the training step waiting on it.
+    workers = CONFIG.num_workers
+    if hard_negative_classes:
+        weights = train_ds.sample_weights(hard_negative_classes, oversample_factor)
+        sampler = torch.utils.data.WeightedRandomSampler(weights, num_samples=len(train_ds), replacement=True)
+        train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler,
+                                   num_workers=workers, pin_memory=True, drop_last=True,
+                                   persistent_workers=workers > 0,
+                                   prefetch_factor=2 if workers > 0 else None)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                                   num_workers=workers, pin_memory=True, drop_last=True,
+                                   persistent_workers=workers > 0,
+                                   prefetch_factor=2 if workers > 0 else None)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                             num_workers=CONFIG.num_workers, pin_memory=True)
+                             num_workers=workers, pin_memory=True,
+                             persistent_workers=workers > 0,
+                             prefetch_factor=2 if workers > 0 else None)
     return train_loader, val_loader
 
 
@@ -119,7 +143,9 @@ def evaluate(model, loader, device, num_classes: int) -> dict:
 def train_phase(phase_cfg: PhaseConfig, class_to_idx: dict[str, int], num_classes: int,
                  class_filter: set[str] | None = None, checkpoint_tag: str | None = None,
                  max_epochs_override: int | None = None, resume: bool = False,
-                 max_hours_override: float | None = None) -> dict:
+                 max_hours_override: float | None = None,
+                 hard_negative_classes: set[str] | None = None,
+                 oversample_factor: float = 5.0) -> dict:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     checkpoint_tag = checkpoint_tag or phase_cfg.name
     max_hours = max_hours_override if max_hours_override is not None else phase_cfg.max_hours
@@ -134,7 +160,8 @@ def train_phase(phase_cfg: PhaseConfig, class_to_idx: dict[str, int], num_classe
     print(f"[{phase_cfg.name}] trainable params: {trainable:,} / {total:,}")
 
     batch_size = load_probed_batch_size(phase_cfg.name, phase_cfg.batch_size)
-    train_loader, val_loader = build_loaders(class_filter, batch_size, class_to_idx)
+    train_loader, val_loader = build_loaders(class_filter, batch_size, class_to_idx,
+                                              hard_negative_classes, oversample_factor)
     steps_per_epoch = max(1, len(train_loader) // phase_cfg.grad_accum_steps)
 
     param_groups = param_groups_for_phase(model, phase_cfg.lr_head, phase_cfg.lr_backbone)
@@ -371,10 +398,86 @@ def run_check_b(manifest_csv: str, class_to_idx: dict):
     return confusable_pass and random_pass
 
 
+def run_hard_negative_mining_check(manifest_csv: str, class_to_idx: dict, num_classes: int,
+                                    oversample_factor: float = 5.0):
+    """Validates hard-negative mining as the fix for the confusable-pairs plateau, after the
+    hierarchical family/role split was reverted (see git history / session notes: it improved
+    confusable but genuinely regressed broad classification, confirmed structural not a
+    combination-rule bug via a swap-only test on the trained checkpoint).
+
+    A confusion-matrix check on the flat head's confusable-subset checkpoint (done earlier)
+    already showed its errors are 100% concentrated inside the 20-class confusable cluster,
+    never scattered elsewhere -- so oversampling exactly those classes during training is a
+    well-targeted intervention, not a guess.
+
+    Unlike Check B's confusable-only training (where every class IS a hard negative, so
+    oversampling does nothing), this trains on confusable UNION random500 -- the setting where
+    hard-negative mining actually matters, since the 20 confusable classes are diluted among
+    ~500+ others and need deliberate oversampling to get concentrated gradient signal. Both
+    subsets' final accuracy get evaluated separately from the same trained model, so this
+    directly tests whether mining can hit both bars at once, the actual full-run scenario in
+    miniature.
+
+    Pre-registered exit criteria (written before running, same discipline as the coverage-gap
+    verification): confusable top5 >= 0.50 (the original threshold) AND random500 top5 >= 0.25
+    (unchanged) = PASS. Either one failing = the flat-head-plus-mining approach isn't sufficient
+    either, and needs its own reassessment rather than another blind iteration.
+    """
+    print("=== Hard-negative mining validation (flat head, confusable classes oversampled) ===")
+    thresholds = SMOKE_TEST_THRESHOLDS
+    print(f"pre-registered exit criteria: confusable top5 >= {thresholds['confusable_top5_min']} "
+          f"AND random500 top5 >= {thresholds['random500_top5_min']}")
+
+    confusable = build_confusable_subset(manifest_csv)
+    random500 = build_random_subset(manifest_csv, size=500)
+    combined = confusable | random500
+    print(f"training on combined set: {len(combined)} classes "
+          f"({len(confusable)} confusable oversampled {oversample_factor}x, "
+          f"{len(random500 - confusable)} other random500 classes at normal weight)")
+
+    train_phase(PHASE_1, class_to_idx, num_classes, class_filter=combined,
+                checkpoint_tag="hnm_p1", max_epochs_override=min(5, thresholds["max_epochs_cap"]),
+                hard_negative_classes=confusable, oversample_factor=oversample_factor)
+    train_phase(PHASE_2, class_to_idx, num_classes, class_filter=combined,
+                checkpoint_tag="hnm_p2", max_epochs_override=thresholds["max_epochs_cap"],
+                hard_negative_classes=confusable, oversample_factor=oversample_factor)
+
+    # evaluate the best checkpoint separately on each subset's own val split
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = build_model(num_classes, pretrained=False).to(device)
+    ckpt = load_checkpoint(CONFIG.checkpoint_dir, tag="hnm_p2_best")
+    model.load_state_dict(ckpt["model_state"])
+
+    batch_size = load_probed_batch_size(PHASE_2.name, PHASE_2.batch_size)
+    results = {}
+    for name, subset in [("confusable", confusable), ("random500", random500)]:
+        _, val_loader = build_loaders(subset, batch_size, class_to_idx)
+        metrics = evaluate(model, val_loader, device, num_classes)
+        results[name] = metrics["top5"]
+        print(f"{name}: top5 = {metrics['top5']:.4f} (top1 = {metrics['top1']:.4f})")
+
+    confusable_pass = results["confusable"] >= thresholds["confusable_top5_min"]
+    random_pass = results["random500"] >= thresholds["random500_top5_min"]
+    print(f"\nHard-negative mining verdict:")
+    print(f"  confusable top5={results['confusable']:.4f} (threshold {thresholds['confusable_top5_min']}) "
+          f"-> {'PASS' if confusable_pass else 'FAIL'}")
+    print(f"  random500 top5={results['random500']:.4f} (threshold {thresholds['random500_top5_min']}) "
+          f"-> {'PASS' if random_pass else 'FAIL'}")
+    if confusable_pass and random_pass:
+        print("  BOTH PASS -- hard-negative mining on the flat head works, proceed with full run "
+              "using this approach (oversample known-confusable clusters during the real training).")
+    else:
+        print("  NOT BOTH PASS -- mining alone isn't sufficient; needs its own reassessment "
+              "rather than another blind iteration.")
+    return confusable_pass and random_pass
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--check-a", action="store_true")
     parser.add_argument("--check-b", action="store_true")
+    parser.add_argument("--check-hnm", action="store_true",
+                         help="validate hard-negative mining on the flat head (confusable classes oversampled)")
     parser.add_argument("--phase", type=int, choices=[1, 2])
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--max-hours", type=float, default=None)
@@ -388,6 +491,8 @@ def main():
         run_check_a(class_to_idx, num_classes)
     elif args.check_b:
         run_check_b(CONFIG.manifest_csv, class_to_idx)
+    elif args.check_hnm:
+        run_hard_negative_mining_check(CONFIG.manifest_csv, class_to_idx, num_classes)
     elif args.phase == 1:
         train_phase(PHASE_1, class_to_idx, num_classes, resume=args.resume,
                     max_hours_override=args.max_hours)

@@ -19,10 +19,16 @@ the last N MBConv blocks.
 
 import math
 
-import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# timm is imported lazily, inside FontEmbeddingModel.__init__, not here at module level. On
+# Windows, DataLoader worker processes (spawn, not fork) re-run this module's top-level imports
+# even though workers only ever touch the Dataset class, never the model -- a module-level timm
+# import was dragging its full transitive dependency chain (huggingface_hub, filelock, etc.)
+# into every worker's memory for nothing, which combined with a tight system RAM budget produced
+# a real MemoryError when num_workers was raised above 0.
 
 
 class ArcMarginProduct(nn.Module):
@@ -74,6 +80,7 @@ class FontEmbeddingModel(nn.Module):
     def __init__(self, num_classes: int, pretrained: bool = True, embedding_dim: int = 1280,
                  arc_s: float = 30.0, arc_m: float = 0.30):
         super().__init__()
+        import timm  # see the module-level comment on the lazy import
         self.backbone = timm.create_model("efficientnet_b0", pretrained=pretrained, num_classes=0)
         self.classifier = ArcMarginProduct(embedding_dim, num_classes, s=arc_s, m=arc_m)
 

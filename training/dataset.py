@@ -74,3 +74,19 @@ class FontDataset(Dataset):
         rel_path, label = self.samples[idx]
         img = Image.open(self.data_dir / rel_path).convert("RGB")
         return self.transform(img), label
+
+    def sample_weights(self, hard_negative_classes: set[str], oversample_factor: float) -> list[float]:
+        """Per-sample weights for a WeightedRandomSampler: hard_negative_classes get
+        oversample_factor, everything else gets 1.0. Used for hard-negative mining -- after a
+        confusion-matrix check confirmed the flat head's errors on the confusable subset are
+        100% concentrated inside that 20-class cluster (never scattered to unrelated classes),
+        oversampling exactly those classes concentrates more gradient signal on the one place
+        the model actually needs it, without touching architecture. class_to_idx isn't enough
+        here since we need the class NAME per sample, not just its index -- reconstruct the
+        idx-to-name lookup once rather than storing names redundantly per sample."""
+        idx_to_class = {i: name for name, i in self.class_to_idx.items()}
+        weights = []
+        for _, label in self.samples:
+            class_name = idx_to_class[label]
+            weights.append(oversample_factor if class_name in hard_negative_classes else 1.0)
+        return weights
