@@ -87,8 +87,9 @@ venv created, folder structure scaffolded, base dependencies installed.
   collapsing bold/italic/regular into one family level class, a deliberate decision to preserve
   style information rather than simplify the label space.
 
-### phase 3, font classifier (stage c) training: in progress, training code built, actual training not yet run
-architecture and methodology decided and implemented:
+### phase 3, font classifier (stage c) training: architecture decided and validated, full run not yet started
+architecture and methodology decided and implemented, then genuinely stress tested rather than
+assumed correct. the path here was not a straight line and the detour is worth knowing:
 
 - **backbone:** efficientnet-b0, pretrained on imagenet, loaded via timm, head replaced for
   3,407 classes.
@@ -131,8 +132,33 @@ architecture and methodology decided and implemented:
   works.
 - environment installed and verified: pytorch with cuda support, torchvision, and timm, all
   confirmed working against the actual gpu.
-- not yet done: running the batch size probe for real, running check a and check b, and running
-  the actual phase one and phase two training.
+
+**check b, run for real, failed the first two times, then passed.** a plain softmax head
+plateaued at 30 percent top 5 on the confusable subset against the 50 percent threshold, while
+the broad 500 class subset passed comfortably. swapping to an arcface head (the standard fix
+for this exact failure signature) only moved confusable to 34 percent, still failing. a
+confusion matrix check on that result showed the true font family landed in the model's top 5
+guesses 69 percent of the time and the true style landed in top 5 89 percent of the time,
+individually strong, but getting both right at once in the same 5 guesses was the hard part.
+that led to trying a hierarchical model, a separate family head and a separate style head
+sharing one backbone. it improved the confusable subset to 41 percent but broke the broad
+subset outright, dropping it from a passing 33 percent down to a failing 22 percent, confirmed
+by direct testing to be a real structural cost of splitting the label space, not a data
+artifact and not fixable by changing how the two heads scores get combined. that architecture
+was reverted.
+
+the fix that actually worked: keep the single flat arcface head, and oversample the twenty
+confusable classes five times over during training so the model sees more of exactly the
+images it struggles with, without changing the model itself. trained on the confusable and
+broad subsets together this way, the same model scored 52 percent on confusable and 28 percent
+on the broad subset, clearing both thresholds at once for the first time. this result was
+checked for the two most likely ways it could be misleading, silent data leakage between the
+oversampled training images and the validation images, and a training accuracy number that
+looked suspiciously low, and both checks came back clean rather than being assumed fine.
+
+not yet done: wiring hard negative oversampling into the actual full phase one and phase two
+training run across all 3,407 classes, not just the smoke test subsets, then running it for
+real.
 
 ### phase 4, text detection (stage a): not started
 planned to start from a pretrained detector (easyocr or craft) rather than building one from
