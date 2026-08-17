@@ -481,11 +481,22 @@ def main():
     parser.add_argument("--phase", type=int, choices=[1, 2])
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--max-hours", type=float, default=None)
+    parser.add_argument("--hard-negative", action="store_true",
+                         help="oversample the confusable-pair classes (see hard_subset.build_confusable_subset) "
+                              "during --phase 1/2 training, validated approach from --check-hnm")
+    parser.add_argument("--oversample-factor", type=float, default=5.0,
+                         help="oversample multiplier for hard-negative classes (default 5.0, matches --check-hnm)")
     args = parser.parse_args()
 
     class_to_idx = {name: i for i, name in enumerate(load_class_list(CONFIG.manifest_csv))}
     num_classes = len(class_to_idx)
     print(f"loaded {num_classes} classes from manifest")
+
+    hard_negative_classes = None
+    if args.hard_negative:
+        hard_negative_classes = build_confusable_subset(CONFIG.manifest_csv)
+        print(f"[hard-negative] oversampling {len(hard_negative_classes)} confusable classes "
+              f"{args.oversample_factor}x during training")
 
     if args.check_a:
         run_check_a(class_to_idx, num_classes)
@@ -495,10 +506,14 @@ def main():
         run_hard_negative_mining_check(CONFIG.manifest_csv, class_to_idx, num_classes)
     elif args.phase == 1:
         train_phase(PHASE_1, class_to_idx, num_classes, resume=args.resume,
-                    max_hours_override=args.max_hours)
+                    max_hours_override=args.max_hours,
+                    hard_negative_classes=hard_negative_classes,
+                    oversample_factor=args.oversample_factor)
     elif args.phase == 2:
         train_phase(PHASE_2, class_to_idx, num_classes, resume=args.resume,
-                    max_hours_override=args.max_hours)
+                    max_hours_override=args.max_hours,
+                    hard_negative_classes=hard_negative_classes,
+                    oversample_factor=args.oversample_factor)
     else:
         parser.print_help()
 
